@@ -1,0 +1,32 @@
+[package]
+name = "wintermute-browser"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "wm-browser"
+path = "src/main.rs"
+
+[lib]
+name = "wintermute_browser"
+path = "src/lib.rs"
+
+[dependencies]
+agorabus = { path = "../agorabus", version = "0.4" }
+anyhow = "1"
+# `native-tls`/`rustls` in chromiumoxide 0.9 gate the chromium *fetcher*
+# (auto-downloader), not the CDP connection. We drive the system
+# google-chrome-stable and connect over a local ws:// endpoint, so the
+# fetcher is unwanted (and broken without a zip backend). `bytes` only.
+chromiumoxide = { version = "0.9", default-features = false, features = ["bytes"] }
+clap = { version = "4", features = ["derive"] }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "process"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
