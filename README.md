@@ -1,59 +1,72 @@
 # wintermute-browser
 
-A long-running daemon `wm-browser` that exposes a small JSON-over-agorabus
-tool interface for the brain: `open`, `read`, `click`, `type`, `back`,
-`find`, `screenshot`. Driven by a headed Chromium instance via CDP
-(`chromiumoxide` crate). Accessibility snapshot is the canonical read mode;
-snapshot is capped at 2000 refs so the brain gets a bounded view of any page.
+A daemon that lets the wintermute brain browse the web by description — `open`, `read`, `find`, `click`, `type`, `back`, `screenshot` — driving a real Chromium over CDP and handing the brain a bounded accessibility view of the page.
 
-Part of the wintermute Fleet 2 action layer — lets the brain browse the web
-by voice description.
+## Why it exists
 
-## Tools
+An LLM browsing the web has two bad options: scrape raw HTML and drown in markup, or take a screenshot and guess at coordinates. Both burn context and miss interactive elements. The third option is the accessibility tree — the same structured view a screen reader uses — where every link, button, and textbox already carries a role and a name. That is the read mode here. The brain works on a flat list of `{ref, role, name}` nodes and refers back to elements by an opaque `ref`; it never sees a pixel or a CSS selector.
+
+The remaining problem is size. A search-results page can carry ten thousand nodes, enough to blow the context window on a single `read`. So the snapshot is capped at 2000 refs and flagged `truncated` when it overflows, and the brain switches to `find` — a server-side filter over the same tree — instead of paging the whole thing.
+
+## How it works
+
+The daemon owns the browser. It launches a headed Chromium (`chromiumoxide`, system `google-chrome-stable`) on the first tool call and keeps it warm. A `read` or `open` runs a DOM walk *inside the page* that stamps each interesting element with a `data-wmref="nN"` attribute and returns the flat node array. Because the ref lives on the element, `click`/`type`/`find` resolve a ref back to a live element by the selector `[data-wmref="nN"]` — there is no separate ref→selector map to drift out of sync.
+
+Tools
 
 | Tool | Args | Returns |
 |---|---|---|
-| `open` | `{url}` | `{ok, title, url, snapshot_id}` |
-| `read` | `{}` | `{snapshot: <a11y-tree-json>, snapshot_id}` |
-| `click` | `{ref}` | `{ok}` — `ref` from snapshot |
-| `type` | `{ref, text, submit?}` | `{ok}` |
-| `back` | `{}` | `{ok, url}` |
-| `find` | `{query}` | `{matches: [{ref,role,name}]}` |
-| `screenshot` | `{}` | `{path}` — PNG into `/tmp/wm-browser-shots/` |
+| `open` | `{url}` | page title and URL, plus a fresh snapshot |
+| `read` | — | the capped a11y snapshot + `truncated` flag |
+| `find` | `{query}` | snapshot nodes whose role or name matches (case-insensitive) |
+| `click` | `{ref}` | navigates / acts on the element at `ref` |
+| `type` | `{ref, text, submit?}` | types into a textbox; `submit:true` presses Enter |
+| `back` | — | navigates back in history |
+| `screenshot` | — | writes a PNG into `/tmp/wm-browser-shots/` |
 
-Requests arrive on agorabus topic `wm.browser.cmd`; replies go on
-`wm.browser.reply` with the `cmd_id` echoed.
+## Two surfaces, one dispatcher
 
-## Acceptance criteria
+The same tool logic runs two ways:
 
-1. `wm-browser open https://example.com` returns `{ok:true, title:"Example Domain"}` within 5 s on a warm browser.
-2. `wm-browser read` returns a snapshot containing at least the H1 text "Example Domain" with role `heading` and a resolvable ref.
-3. `wm-browser find {query:"More information"}` on example.com returns at least one match with role `link` and a usable ref.
-4. `wm-browser click {ref}` on the matched link navigates to the target page; subsequent `read` returns the new page's title.
-5. `wm-browser type {ref, text, submit:true}` on Google's search box submits and lands on a results page.
-6. Brain (wmd) registers `browser.open` etc. as Claude tools — a `recall` log entry confirms the tool was called from a brain turn.
-7. Snapshot capped at 2000 refs; on a large page `read` returns `truncated:true` and brain falls back to `find`.
-8. Daemon idle timeout: no tool call for 5 min → exits with rc=0 and removes its lockfile.
-9. Crash recovery: kill -9 the Chromium subprocess → daemon detects within 2 s, restarts the browser, next tool call succeeds.
-10. **[live]** Real user round-trip: jsy says "find me a recipe for chicken soup", brain plans `open → find → click → read`, dialog speaks the summary.
+- **Daemon.** `wm-browser daemon` subscribes to `wm.browser.cmd` on agorabus, dispatches each command, and publishes a reply on `wm.browser.reply` with the originating `cmd_id` echoed. After `--idle-secs` with no traffic (default 300) it exits cleanly and removes its lockfile.
+- **One-shot CLI.** `wm-browser open <url>`, `wm-browser read`, and the rest launch a browser, run a single tool, print the JSON reply, and close. Useful for testing a tool without the bus.
 
-ACs 1–5, 7–9 have passing offline unit tests. AC6 and AC10 require real Chromium + wmd (runtime/live-gated).
+Both paths route through the same dispatcher, so argument handling and result shapes match exactly. Replies — on the bus and on stdout — share one envelope: `{ok, result}` on success, `{ok:false, error}` on failure.
+
+If the Chromium child dies (a `kill -9`, a crash), the session detects the dropped CDP connection on the next tool call, relaunches the browser, and retries — so a single crash costs one extra round-trip, not the daemon.
 
 ## Install
 
-Prerequisites: `chromium` from the Arch repo (system CDP target), `agorabus` daemon running.
+Needs the system `google-chrome-stable` and a running `agorabus` daemon.
 
 ```bash
 cargo build --release
 install -Dm755 target/release/wm-browser ~/.local/bin/wm-browser
 ```
 
-Start the daemon:
+Run the daemon:
+
 ```bash
-wm-browser daemon
+wm-browser daemon            # default 5-minute idle timeout
+wm-browser daemon --idle-secs 600
 ```
+
+Or drive a single tool without the bus:
+
+```bash
+wm-browser open https://example.com
+wm-browser find "More information"
+wm-browser click n7
+```
+
+## Where it fits
+
+Part of the wintermute fleet's action layer — the daemons the voice brain calls as tools, talking to each other over agorabus. This one is the brain's hands on the web.
+
+## Status
+
+The pure pieces — snapshot capping, `find` filtering, idle/lockfile bookkeeping, crash-detection predicate, wire envelopes — have offline unit tests (see `tests/acceptance.rs`), each mapped to the acceptance criterion it covers. The criteria that need a live Chromium and a running brain — the full open→find→click→read round-trip, tool registration in the brain — are exercised at runtime, not in CI.
 
 ## License
 
-Licensed under either of MIT or Apache-2.0 at your option.
-See [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
+MIT or Apache-2.0, at your option. See [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
